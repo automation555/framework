@@ -138,6 +138,15 @@ class QueueManager implements FactoryContract, MonitorContract
             $this->connections[$name] = $this->resolve($name);
 
             $this->connections[$name]->setContainer($this->app);
+
+            $this->connections[$name]->configurePushingRetries(
+                $this->app['config']['queue.retry_pushing.times'] ?? 0,
+                $this->app['config']['queue.retry_pushing.sleep'] ?? 0
+            );
+
+            if ($this->app['config']['queue.secondary.enabled'] ?? false) {
+                $this->connections[$name]->enableSecondaryQueue();
+            }
         }
 
         return $this->connections[$name];
@@ -244,33 +253,6 @@ class QueueManager implements FactoryContract, MonitorContract
     public function getName($connection = null)
     {
         return $connection ?: $this->getDefaultDriver();
-    }
-
-    /**
-     * Get the application instance used by the manager.
-     *
-     * @return \Illuminate\Contracts\Foundation\Application
-     */
-    public function getApplication()
-    {
-        return $this->app;
-    }
-
-    /**
-     * Set the application instance used by the manager.
-     *
-     * @param  \Illuminate\Contracts\Foundation\Application  $app
-     * @return $this
-     */
-    public function setApplication($app)
-    {
-        $this->app = $app;
-
-        foreach ($this->connections as $connection) {
-            $connection->setContainer($app);
-        }
-
-        return $this;
     }
 
     /**

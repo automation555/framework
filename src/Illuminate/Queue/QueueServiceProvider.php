@@ -15,6 +15,8 @@ use Illuminate\Queue\Failed\DatabaseFailedJobProvider;
 use Illuminate\Queue\Failed\DatabaseUuidFailedJobProvider;
 use Illuminate\Queue\Failed\DynamoDbFailedJobProvider;
 use Illuminate\Queue\Failed\NullFailedJobProvider;
+use Illuminate\Queue\Secondary\DatabaseSecondaryQueueProvider;
+use Illuminate\Queue\Secondary\NullSecondaryQueueProvider;
 use Illuminate\Support\Arr;
 use Illuminate\Support\ServiceProvider;
 
@@ -32,6 +34,7 @@ class QueueServiceProvider extends ServiceProvider implements DeferrableProvider
         $this->registerWorker();
         $this->registerListener();
         $this->registerFailedJobServices();
+        $this->registerSecondaryQueueServices();
     }
 
     /**
@@ -166,16 +169,11 @@ class QueueServiceProvider extends ServiceProvider implements DeferrableProvider
                 return $this->app->isDownForMaintenance();
             };
 
-            $resetScope = function () use ($app) {
-                return $app->forgetScopedInstances();
-            };
-
             return new Worker(
                 $app['queue'],
                 $app['events'],
                 $app[ExceptionHandler::class],
-                $isDownForMaintenance,
-                $resetScope
+                $isDownForMaintenance
             );
         });
     }
@@ -268,6 +266,26 @@ class QueueServiceProvider extends ServiceProvider implements DeferrableProvider
     }
 
     /**
+     * Register the secondary queue services.
+     *
+     * @return void
+     */
+    protected function registerSecondaryQueueServices()
+    {
+        $this->app->singleton('queue.secondary', function ($app) {
+            $config = $app['config']['queue.secondary'];
+
+            if ($config['driver'] === 'database') {
+                return new DatabaseSecondaryQueueProvider(
+                    $this->app['db'], $config['database'], $config['table']
+                );
+            } else {
+                return new NullSecondaryQueueProvider();
+            }
+        });
+    }
+
+    /**
      * Get the services provided by the provider.
      *
      * @return array
@@ -278,6 +296,7 @@ class QueueServiceProvider extends ServiceProvider implements DeferrableProvider
             'queue',
             'queue.connection',
             'queue.failer',
+            'queue.secondary',
             'queue.listener',
             'queue.worker',
         ];

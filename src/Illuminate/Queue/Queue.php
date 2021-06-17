@@ -5,9 +5,6 @@ namespace Illuminate\Queue;
 use Closure;
 use DateTimeInterface;
 use Illuminate\Container\Container;
-use Illuminate\Contracts\Encryption\Encrypter;
-use Illuminate\Contracts\Queue\ShouldBeEncrypted;
-use Illuminate\Queue\Events\JobQueued;
 use Illuminate\Support\Arr;
 use Illuminate\Support\InteractsWithTime;
 use Illuminate\Support\Str;
@@ -31,11 +28,18 @@ abstract class Queue
     protected $connectionName;
 
     /**
-     * Indicates that jobs should be dispatched after all database transactions have committed.
+     * Pushing retries configuration.
      *
-     * @return $this
+     * @var array
      */
-    protected $dispatchAfterCommit;
+    protected $pushingRetriesConfiguration;
+
+    /**
+     * Indicate if the secondary queue is enabled.
+     *
+     * @var bool
+     */
+    protected $secondaryQueue;
 
     /**
      * The create payload callbacks.
@@ -143,7 +147,6 @@ abstract class Queue
             'job' => 'Illuminate\Queue\CallQueuedHandler@call',
             'maxTries' => $job->tries ?? null,
             'maxExceptions' => $job->maxExceptions ?? null,
-            'failOnTimeout' => $job->failOnTimeout ?? false,
             'backoff' => $this->getJobBackoff($job),
             'timeout' => $job->timeout ?? null,
             'retryUntil' => $this->getJobExpiration($job),
@@ -153,15 +156,11 @@ abstract class Queue
             ],
         ]);
 
-        $command = $this->jobShouldBeEncrypted($job) && $this->container->bound(Encrypter::class)
-                    ? $this->container[Encrypter::class]->encrypt(serialize(clone $job))
-                    : serialize(clone $job);
-
         return array_merge($payload, [
-            'data' => array_merge($payload['data'], [
+            'data' => [
                 'commandName' => get_class($job),
-                'command' => $command,
-            ]),
+                'command' => serialize(clone $job),
+            ],
         ]);
     }
 
@@ -215,21 +214,6 @@ abstract class Queue
     }
 
     /**
-     * Determine if the job should be encrypted.
-     *
-     * @param  object  $job
-     * @return bool
-     */
-    protected function jobShouldBeEncrypted($job)
-    {
-        if ($job instanceof ShouldBeEncrypted) {
-            return true;
-        }
-
-        return isset($job->shouldBeEncrypted) && $job->shouldBeEncrypted;
-    }
-
-    /**
      * Create a typical, string based queue payload array.
      *
      * @param  string  $job
@@ -245,7 +229,6 @@ abstract class Queue
             'job' => $job,
             'maxTries' => null,
             'maxExceptions' => null,
-            'failOnTimeout' => false,
             'backoff' => null,
             'timeout' => null,
             'data' => $data,
@@ -255,7 +238,7 @@ abstract class Queue
     /**
      * Register a callback to be executed when creating job payloads.
      *
-     * @param  callable|null  $callback
+     * @param  callable  $callback
      * @return void
      */
     public static function createPayloadUsing($callback)
@@ -299,52 +282,20 @@ abstract class Queue
      */
     protected function enqueueUsing($job, $payload, $queue, $delay, $callback)
     {
-        if ($this->shouldDispatchAfterCommit($job) &&
-            $this->container->bound('db.transactions')) {
-            return $this->container->make('db.transactions')->addCallback(
-                function () use ($payload, $queue, $delay, $callback, $job) {
-                    return tap($callback($payload, $queue, $delay), function ($jobId) use ($job) {
-                        $this->raiseJobQueuedEvent($jobId, $job);
-                    });
-                }
+        try {
+            return retry(
+                ($this->pushingRetriesConfiguration['times'] ?? 1) + 1,
+                function () use ($delay, $queue, $payload, $callback) {
+                    return $callback($payload, $queue, $delay);
+                },
+                $this->pushingRetriesConfiguration['sleep'] ?? 0
             );
-        }
+        } catch (\Throwable $e) {
+            if ($this->secondaryQueue) {
+                return $this->storeInSecondaryQueue($job, $queue, $delay, $e);
+            }
 
-        return tap($callback($payload, $queue, $delay), function ($jobId) use ($job) {
-            $this->raiseJobQueuedEvent($jobId, $job);
-        });
-    }
-
-    /**
-     * Determine if the job should be dispatched after all database transactions have committed.
-     *
-     * @param  \Closure|string|object  $job
-     * @return bool
-     */
-    protected function shouldDispatchAfterCommit($job)
-    {
-        if (is_object($job) && isset($job->afterCommit)) {
-            return $job->afterCommit;
-        }
-
-        if (isset($this->dispatchAfterCommit)) {
-            return $this->dispatchAfterCommit;
-        }
-
-        return false;
-    }
-
-    /**
-     * Raise the job queued event.
-     *
-     * @param  string|int|null  $jobId
-     * @param  \Closure|string|object  $job
-     * @return void
-     */
-    protected function raiseJobQueuedEvent($jobId, $job)
-    {
-        if ($this->container->bound('events')) {
-            $this->container['events']->dispatch(new JobQueued($this->connectionName, $jobId, $job));
+            throw $e;
         }
     }
 
@@ -372,16 +323,6 @@ abstract class Queue
     }
 
     /**
-     * Get the container instance being used by the connection.
-     *
-     * @return \Illuminate\Container\Container
-     */
-    public function getContainer()
-    {
-        return $this->container;
-    }
-
-    /**
      * Set the IoC container instance.
      *
      * @param  \Illuminate\Container\Container  $container
@@ -390,5 +331,44 @@ abstract class Queue
     public function setContainer(Container $container)
     {
         $this->container = $container;
+    }
+
+    /**
+     * Configure pushing retries.
+     *
+     * @return void
+     */
+    public function configurePushingRetries($times, $sleep)
+    {
+        $this->pushingRetriesConfiguration = compact('times', 'sleep');
+    }
+
+    /**
+     * Enable storing in the secondary queue.
+     *
+     * @return void
+     */
+    public function enableSecondaryQueue()
+    {
+        $this->secondaryQueue = true;
+    }
+
+    /**
+     * Store the given job in the secondary queue.
+     *
+     * @param  mixed  $job
+     * @param  string  $queue
+     * @param  \DateTimeInterface|\DateInterval|int|null  $delay
+     * @param  \Throwable  $e
+     */
+    protected function storeInSecondaryQueue($job, $queue, $delay, $e): void
+    {
+        $this->container['queue.secondary']->push(
+            $this->getConnectionName(),
+            $queue,
+            serialize($job),
+            $delay,
+            $e
+        );
     }
 }
