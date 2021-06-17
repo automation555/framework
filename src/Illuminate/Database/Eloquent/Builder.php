@@ -635,6 +635,9 @@ class Builder
      */
     protected function eagerLoadRelation(array $models, $name, Closure $constraints)
     {
+        // Extract any aliased relationships.
+        [$name, $alias] = array_pad(explode(' as ', $name), 2, $name);
+
         // First we will "back up" the existing where conditions on the query so we can
         // add our eager constraints. Then we will merge the wheres that were on the
         // query back to it in order that any where conditions might be specified.
@@ -648,8 +651,8 @@ class Builder
         // using the relationship instance. Then we just return the finished arrays
         // of models which have been eagerly hydrated and are readied for return.
         return $relation->match(
-            $relation->initRelation($models, $name),
-            $relation->getEager(), $name
+            $relation->initRelation($models, $alias),
+            $relation->getEager(), $alias
         );
     }
 
@@ -1139,9 +1142,7 @@ class Builder
             // Next we'll pass the scope callback to the callScope method which will take
             // care of grouping the "wheres" properly so the logical order doesn't get
             // messed up when adding scopes. Then we'll return back out the builder.
-            $builder = $builder->callNamedScope(
-                $scope, Arr::wrap($parameters)
-            );
+            $builder = $builder->callNamedScope($scope, (array) $parameters);
         }
 
         return $builder;
